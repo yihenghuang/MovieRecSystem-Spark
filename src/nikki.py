@@ -27,6 +27,7 @@ def div(x):
 		return (x[0], x[1], x[2]/(sqrt(x[3])*sqrt(x[4])))
 
 
+
 ##	function used to predict user's rating
 ##	input: ((user-id,item-id), ((top-n list for this item, list of items this user rated), average rating for this item))
 ##	output ((item-id, user-id), prediction)

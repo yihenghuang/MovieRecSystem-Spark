@@ -16,6 +16,7 @@ def func(x):
 	return result
 
 
+
 ##	function used to calculate pearson correlation
 ##	input: sum of all [normalized_rating1 * normalized_rating2, (normalized_rating1)^2, (normalized_rating2)^2]
 ##	for one item
