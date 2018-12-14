@@ -1,0 +1,164 @@
+import sys
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import *
+from math import *
+from heapq import nlargest
+
+##	function, to generate all pairs of [item1, item2, rating1, rating2] for each user
+##	input: (user, list of (item-id, item's normalzied rating))
+##	output: all pairs of [item1, item2, rating1, rating2] for each user
+def func(x):
+	result=[]
+	size=len(x[1])
+	for i in range(0,size-1):
+		for j in range(i+1, size):
+			result.append([(x[1][i][0],x[1][i][2],x[1][j][0],x[1][j][2]),[x[1][i][1],x[1][j][1]]])
+	return result
+
+
+##	function used to calculate pearson correlation
+##	input: sum of all [normalized_rating1 * normalized_rating2, (normalized_rating1)^2, (normalized_rating2)^2]
+##	for one item
+##	output: ((item-item), pearson_correlation)
+def div(x):
+	if (sqrt(x[3])*sqrt(x[4]))==0:
+		return 0
+	else:
+		return (x[0], x[1], x[2]/(sqrt(x[3])*sqrt(x[4])))
+
+
+##	function used to predict user's rating
+##	input: ((user-id,item-id), ((top-n list for this item, list of items this user rated), average rating for this item))
+##	output ((item-id, user-id), prediction)
+def predict(x):
+	result=[]
+	for i in x[0][0]:
+		ss=False
+		if len(result) < 30 and i[2] > 0.75:
+			for j in x[0][1]:
+				if i[0]==j[0]:
+					result.append(float(j[1]))
+					ss=True
+	if len(result) == 0: 
+		return x[1]
+	return sum(result)/len(result)
+
+
+
+
+##	code begins
+
+sc = SparkContext()
+
+#step 1, generate [user, list of [movie,rating] pairs]...
+
+##read training data 
+file= sc.textFile('s3://n.xie-emr/input_proj')
+copied2 = file
+## calculate the average rating for each item (item-id, average-rating)
+avg1 = file.map(lambda x : (x.split(",")[0], [float(x.split(",")[2]),1]))
+avg2 = avg1.reduceByKey(lambda x1,x2: (x1[0]+x2[0],x1[1]+x2[1])).mapValues(lambda x: x[0]/float(x[1]))
+## intemediate data used to generate (user-id, (item-id, normalized rating, i.e. this user's rating to item a - average rating 
+# item a receives))
+intermediate1 = file.map(lambda x : ( x.split(",")[0], float(x.split(",")[2]))).join(avg2).mapValues(lambda x: (x[0]-x[1]))
+#intermediate1 = file.map(lambda x : ( x.split(",")[0], float(x.split(",")[2]))).join(avg2).mapValues(lambda x: (x[0]-x[1]))
+
+intermediate2 = file.map(lambda x: (x.split(",")[0], x.split(",")[1])).join(intermediate1)
+## (user-id, (item-id, normalized rating))
+
+#user_with_normalized_rating = intermediate2.map(lambda x :(x[1][0],(x[0],x[1][1])))
+user_with_normalized_rating = copied2.map(lambda x : (x.split(",")[0], (x.split(",")[1], x.split(",")[2]))).join(avg2).map(lambda x:(x[1][0][0],(x[0],x[1][0][1],x[1][1])))
+##group with user-id, generate (user-id, list of (item-id, normalized rating))
+user_with_list_of_normalized_rating = user_with_normalized_rating.distinct().groupByKey()
+##process the format of list 
+user_with_list_of_normalized_rating2 = user_with_list_of_normalized_rating.map(lambda x: (x[0], list(x[1])))
+    
+
+## generate [item1, item2, normalized_rating1, normalized_rating2]
+pairs = user_with_list_of_normalized_rating2.map(func)
+
+#step 1 finished...
+
+#step 2, calculate pearson correlation for each item-item pair...
+
+## generate data for the use of pearson calculation, the data is in the form: 
+## (item1, item2, [normalized_rating1 * normalized_rating2, (normalized_rating1)^2, (normalized_rating2)^2])
+pearson1 = pairs.flatMap(lambda x: x).mapValues(lambda x: (float(x[0])*float(x[1]),float(x[0])**2,float(x[1])**2))
+## aggregate all the data for each item-item pair
+#pearson1_mapped = pearson1.map(lambda x: ((x[0][0],x[0][2]),(x[0][1],x[0][3], x[1][0], x[1][1], x[1][2])))
+pearson1_mapped = pearson1.map(lambda x: ((x[0][0], x[0][2]), [(x[0][1],x[0][3],x[1])]))
+#pearson2= pearson1.reduceByKey(lambda x1,x2:(x1[1]+x2[1],x1[2]+x2[2],x1[3]+x2[3]))
+
+mapped2 = pearson1_mapped.map(lambda x: (x[0], [x[1][0][0], x[1][0][1], x[1][0][2][0], x[1][0][2][1], x[1][0][2][2]]))
+
+pearson2= mapped2.reduceByKey(lambda x1,x2:(x1[0],x1[1],x1[2]+x2[2],x1[3]+x2[3],x1[4]+x2[4]))
+
+## ((item1, average_rating, item2, average_rating),correlation)
+
+pearson_correlation = pearson2.mapValues(div)
+
+## map ((item1, item2), correlation) into [item1,(item2,correlation)], [item2,(item1,correlation)]
+flat_mapped = pearson_correlation.map(lambda x: ([x[0][0], (x[0][1], x[1][1], x[1][2])],[x[0][1],(x[0][0],x[1][0],x[1][2])])).flatMap(lambda x:x)
+
+
+## sort the item,item pairs based on correlation
+#sorted_correlation_pairs=mapped_pearson.sortBy(lambda x:(x[0],x[1][1]))
+
+## [item1, [list of item and correlation]]
+grouped = flat_mapped.groupByKey()
+
+## get top N items with the largest correlation for each item 
+topN=grouped.map(lambda x:(x[0],nlargest(100,x[1],key=lambda g:g[2])))
+
+#	step 2 finished...
+
+topN.saveAsTextFile('s3://n.xie-emr/topNN')
+
+#	step 3, predict the rating of all user-item pairs in testing ratings...
+
+##	read testing ratings
+testing= sc.textFile('s3://n.xie-emr/input_test')
+
+##	parse the testing data into (item-id, user-id) pairs
+movie_user_pairs= testing.map(lambda x:(x.split(",")[0],x.split(",")[1]))
+
+##	parse the testing data into ((item-id, user-id), rating) pairs
+movie_user_rating_pairs = testing.map(lambda x: ((x.split(",")[0],x.split(",")[1]), x.split(",")[2]))
+
+##	join top N list with item, user pairs, generate (user-id, [item-id, (item-id, correlation])
+joined=movie_user_pairs.join(topN).map(lambda x:(x[1][0],[x[0],x[1][1]]))
+
+##	group (user-id, (item-id,rating))
+rated=file.map(lambda x:(x.split(",")[1],(x.split(",")[0],x.split(",")[2]))).groupByKey().map(lambda x:(x[0],list(x[1])))
+##	((user-id,item-id), (top-n list for this item, list of items this user rated))
+pre_prediction=joined.join(rated).map(lambda x:((x[0],x[1][0][0]),(x[1][0][1],x[1][1])))
+##	join average data in
+pre_prediction2 = pre_prediction.map(lambda x: (x[0][1],(x[0][0],x[1]))).join(avg2)
+##	generate ((user-id,item-id), (top-n list for this item, list of items this user rated, average rating for this item))
+pre_prediction_final =pre_prediction2.map(lambda x:((x[0],x[1][0][0]),(x[1][0][1],x[1][1])))
+
+
+##	the results of all predictions for item-user pairs 
+prediction=pre_prediction_final.mapValues(predict)
+
+#	step 3 finished ...
+
+pre_prediction_final.saveAsTextFile('s3://n.xie-emr/preprediction')
+#	step 4, calculate the absolute mean error and root mean squared error ...
+
+
+##	filter out the predictions that are not in the testing ratings txt file 
+filtered_prediction = prediction.union(movie_user_rating_pairs).groupByKey().map(lambda x: (x[0], list(x[1]))).filter(lambda x: (len(x[1])==2))
+copied = filtered_prediction
+## 	calculate the mean absolute error of our predictions 
+lucky = copied.map(lambda x : (1, (abs(x[1][0] - float(x[1][1])),1))).reduceByKey(lambda x,y: (x[0]+y[0],x[1]+y[1])).map(lambda x: x[1][0]/x[1][1])
+##	calculate the root mean squared error (RMSE)
+var = filtered_prediction.map(lambda x : (1, ((x[1][0] - float(x[1][1]))**2,1))).reduceByKey(lambda x,y: (x[0]+y[0],x[1]+y[1])).map(lambda x: (sqrt(x[1][0]/x[1][1])))
+
+##	save results
+var.saveAsTextFile('s3://n.xie-emr/var')
+lucky.saveAsTextFile('s3://n.xie-emr/output5')
+
+#	step 4 finished ...
+
+sc.stop()
